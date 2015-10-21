@@ -1,0 +1,9 @@
+	Hi,
+
+	Voucher generated!
+
+	You get a voucher for your next buys:
+
+	{voucher_data}
+
+	{shop_url} powered by PrestaShop™

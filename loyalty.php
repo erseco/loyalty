@@ -42,7 +42,7 @@ class Loyalty extends Module
 	{
 		$this->name = 'loyalty';
 		$this->tab = 'pricing_promotion';
-		$this->version = '1.2.8';
+		$this->version = '1.2.9';
 		$this->author = 'PrestaShop';
 		$this->need_instance = 0;
 
@@ -93,6 +93,7 @@ class Loyalty extends Module
 			$category_config .= (int)$category['id_category'].',';
 		$category_config = rtrim($category_config, ',');
 		Configuration::updateValue('PS_LOYALTY_VOUCHER_CATEGORY', $category_config);
+		Configuration::updateValue('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE', $category_config);
 
 		/* This hook is optional */
 		$this->registerHook('displayMyAccountBlock');
@@ -155,7 +156,8 @@ class Loyalty extends Module
 	{
 		if (!parent::uninstall() || !$this->uninstallDB() || !Configuration::deleteByName('PS_LOYALTY_POINT_VALUE')	|| !Configuration::deleteByName('PS_LOYALTY_POINT_RATE')
 			|| !Configuration::deleteByName('PS_LOYALTY_NONE_AWARD') || !Configuration::deleteByName('PS_LOYALTY_MINIMAL') || !Configuration::deleteByName('PS_LOYALTY_VOUCHER_CATEGORY')
-			|| !Configuration::deleteByName('PS_LOYALTY_VOUCHER_DETAILS') || !Configuration::deleteByName('PS_LOYALTY_TAX') || !Configuration::deleteByName('PS_LOYALTY_VALIDITY_PERIOD'))
+			|| !Configuration::deleteByName('PS_LOYALTY_VOUCHER_DETAILS') || !Configuration::deleteByName('PS_LOYALTY_TAX') || !Configuration::deleteByName('PS_LOYALTY_VALIDITY_PERIOD')
+			|| !Configuration::deleteByName('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE') )
 			return false;
 		return true;
 	}
@@ -180,15 +182,21 @@ class Loyalty extends Module
 			$this->_errors = array();
 			if (!is_array(Tools::getValue('categoryBox')) || !count(Tools::getValue('categoryBox')))
 				$this->_errors[] = $this->l('You must choose at least one category for voucher\'s action');
+			if (!is_array(Tools::getValue('categoryBoxSource')) || !count(Tools::getValue('categoryBoxSource')))
+				$this->_errors[] = $this->l('You must choose at least one category source for voucher\'s action');
 			if (!count($this->_errors))
 			{
 				Configuration::updateValue('PS_LOYALTY_VOUCHER_CATEGORY', $this->voucherCategories(Tools::getValue('categoryBox')));
+				Configuration::updateValue('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE', $this->voucherCategories(Tools::getValue('categoryBoxSource')));
 				Configuration::updateValue('PS_LOYALTY_POINT_VALUE', (float)(Tools::getValue('point_value')));
+				Configuration::updateValue('PS_LOYALTY_POINT_PERCENT', (float)(Tools::getValue('point_percent')));
 				Configuration::updateValue('PS_LOYALTY_POINT_RATE', (float)(Tools::getValue('point_rate')));
 				Configuration::updateValue('PS_LOYALTY_NONE_AWARD', (int)(Tools::getValue('PS_LOYALTY_NONE_AWARD')));
 				Configuration::updateValue('PS_LOYALTY_MINIMAL', (float)(Tools::getValue('minimal')));
 				Configuration::updateValue('PS_LOYALTY_TAX', (int)(Tools::getValue('PS_LOYALTY_TAX')));
 				Configuration::updateValue('PS_LOYALTY_VALIDITY_PERIOD', (int)(Tools::getValue('validity_period')));
+				Configuration::updateValue('PS_LOYALTY_AUTOVOUCHER', (bool)(Tools::getValue('PS_LOYALTY_AUTOVOUCHER')));
+				Configuration::updateValue('PS_LOYALTY_AUTOVOUCHER_EMAIL', (bool)(Tools::getValue('PS_LOYALTY_AUTOVOUCHER_EMAIL')));
 
 				$this->loyaltyStateValidation->id_order_state = (int)(Tools::getValue('id_order_state_validation'));
 				$this->loyaltyStateCancel->id_order_state = (int)(Tools::getValue('id_order_state_cancel'));
@@ -254,6 +262,8 @@ class Loyalty extends Module
 		$this->_postProcess();
 
 		$this->html .= $this->renderForm();
+
+		$this->context->controller->addJS($this->_path.'/js/loyalty-admin.js');
 
 		return $this->html;
 	}
@@ -414,6 +424,10 @@ class Loyalty extends Module
 				$loyalty->id_loyalty_state = LoyaltyStateModule::getValidationId();
 				if ((int)$loyalty->points < 0)
 					$loyalty->points = abs((int)$loyalty->points);
+				// We create auto-voucher coupon
+				if ((bool)Configuration::get('PS_LOYALTY_AUTOVOUCHER'))
+					$this->processTransformPoints((int)$order->id_customer);
+
 			}
 			elseif ($new_order->id == $this->loyaltyStateCancel->id_order_state)
 			{
@@ -423,6 +437,120 @@ class Loyalty extends Module
 			return $loyalty->save();
 		}
 		return true;
+	}
+
+	public function processTransformPoints($id_customer)
+	{
+		$customer_points = (int)LoyaltyModule::getPointsByCustomer((int)$id_customer);
+		if ($customer_points > 0)
+		{
+			/* Generate a voucher code */
+			$voucher_code = null;
+			do
+				$voucher_code = 'FID'.rand(1000, 100000);
+			while (CartRule::cartRuleExists($voucher_code));
+
+			// Voucher creation and affectation to the customer
+			$cart_rule = new CartRule();
+			$cart_rule->code = $voucher_code;
+			$cart_rule->id_customer = (int)$id_customer;
+			$cart_rule->reduction_currency = (int)$this->context->currency->id;
+			$cart_rule->reduction_amount = LoyaltyModule::getVoucherValue((int)$customer_points);
+			$cart_rule->quantity = 1;
+			$cart_rule->highlight = 1;
+			$cart_rule->quantity_per_user = 1;
+			$cart_rule->reduction_tax = (bool)Configuration::get('PS_LOYALTY_TAX');
+
+			// If merchandise returns are allowed, the voucher musn't be usable before this max return date
+			$date_from = Db::getInstance()->getValue('
+			SELECT UNIX_TIMESTAMP(date_add) n
+			FROM '._DB_PREFIX_.'loyalty
+			WHERE id_cart_rule = 0 AND id_customer = '.(int)$id_customer.'
+			ORDER BY date_add DESC');
+
+			if (Configuration::get('PS_ORDER_RETURN'))
+				$date_from += 60 * 60 * 24 * (int)Configuration::get('PS_ORDER_RETURN_NB_DAYS');
+
+			$cart_rule->date_from = date('Y-m-d H:i:s', $date_from);
+			$cart_rule->date_to = date('Y-m-d H:i:s', strtotime($cart_rule->date_from.' +1 year'));
+
+			$cart_rule->minimum_amount = (float)Configuration::get('PS_LOYALTY_MINIMAL');
+			$cart_rule->minimum_amount_currency = (int)$this->context->currency->id;
+			$cart_rule->active = 1;
+
+			$categories = Configuration::get('PS_LOYALTY_VOUCHER_CATEGORY');
+			if ($categories != '' && $categories != 0)
+				$categories = explode(',', Configuration::get('PS_LOYALTY_VOUCHER_CATEGORY'));
+			else
+				die (Tools::displayError());
+
+			$languages = Language::getLanguages(true);
+			$default_text = Configuration::get('PS_LOYALTY_VOUCHER_DETAILS', (int)Configuration::get('PS_LANG_DEFAULT'));
+
+			foreach ($languages as $language)
+			{
+				$text = Configuration::get('PS_LOYALTY_VOUCHER_DETAILS', (int)$language['id_lang']);
+				$cart_rule->name[(int)$language['id_lang']] = $text ? strval($text) : strval($default_text);
+			}
+
+			$contains_categories = is_array($categories) && count($categories);
+			if ($contains_categories)
+				$cart_rule->product_restriction = 1;
+			$cart_rule->add();
+
+			//Restrict cartRules with categories
+			if ($contains_categories)
+			{
+				//Creating rule group
+				$id_cart_rule = (int)$cart_rule->id;
+				$sql = "INSERT INTO "._DB_PREFIX_."cart_rule_product_rule_group (id_cart_rule, quantity) VALUES ('$id_cart_rule', 1)";
+				Db::getInstance()->execute($sql);
+				$id_group = (int)Db::getInstance()->Insert_ID();
+
+				//Creating product rule
+				$sql = "INSERT INTO "._DB_PREFIX_."cart_rule_product_rule (id_product_rule_group, type) VALUES ('$id_group', 'categories')";
+				Db::getInstance()->execute($sql);
+				$id_product_rule = (int)Db::getInstance()->Insert_ID();
+
+				//Creating restrictions
+				$values = array();
+				foreach ($categories as $category) {
+					$category = (int)$category;
+					$values[] = "('$id_product_rule', '$category')";
+				}
+				$values = implode(',', $values);
+				$sql = "INSERT INTO "._DB_PREFIX_."cart_rule_product_rule_value (id_product_rule, id_item) VALUES $values";
+				Db::getInstance()->execute($sql);
+			}
+
+			// Register order(s) which contributed to create this voucher
+			if (!LoyaltyModule::registerDiscount($cart_rule))
+				$cart_rule->delete();
+
+			// Send the email
+			if ((bool)Configuration::get('PS_LOYALTY_AUTOVOUCHER_EMAIL'))
+				$this->sendEmail((int)$id_customer, LoyaltyModule::getVoucherValue((int)$customer_points));
+
+		}
+
+	}
+
+	/* Send e-mail on auto-voucher generated */
+	public function sendEmail($id_customer, $voucher_amount)
+	{
+		$customer = new Customer($id_customer);
+		$customer_email = $customer->email;
+
+		$id_lang = (int)$this->context->language->id;
+		$iso_lang = Language::getIsoById($id_lang);
+
+		if (!is_dir(dirname(__FILE__).'/mails/'.Tools::strtolower($iso_lang)))
+			$id_lang = Language::getIdByIso('en');
+
+		Mail::Send($id_lang, 'auto_voucher', Mail::l('Auto-Voucher Generated!',
+		(int)$this->context->language->id), array('{voucher_data}' => $voucher_amount), $customer_email,
+		null, null, null, null, null, _PS_MODULE_DIR_.$this->name.'/mails/');
+
 	}
 
 	/* Hook display in tab AdminCustomers on BO */
@@ -527,6 +655,11 @@ class Loyalty extends Module
 		$root_category = Category::getRootCategory();
 		$root_category = array('id_category' => $root_category->id, 'name' => $root_category->name);
 
+		if (Tools::getValue('categoryBoxSource'))
+			$selected_categories_source = Tools::getValue('categoryBoxSource');
+		else
+			$selected_categories_source = explode(',', Configuration::get('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE'));
+
 		if (Tools::getValue('categoryBox'))
 			$selected_categories = Tools::getValue('categoryBox');
 		else
@@ -553,6 +686,12 @@ class Loyalty extends Module
 						'name' => 'point_value',
 						'prefix' => $currency->sign,
 						'suffix' => $this->l('for the discount.'),
+					),
+					array(
+						'type' => 'text',
+						'label' => $this->l('1 point ='),
+						'name' => 'point_percent',
+						'prefix' => '%',
 					),
 					array(
 						'type' => 'text',
@@ -629,6 +768,37 @@ class Loyalty extends Module
 							)
 						)
 					),
+
+					array(
+						'type' => 'categories',
+						'label' => $this->l('The following categories can be used for generate loyalty points:'),
+						'name' => 'categoryBoxSource',
+						'desc' => $this->l('Mark the boxes of categories which generates loyalty points.'),
+						'tree' => array(
+							'use_search' => false,
+							'id' => 'categoryBoxSource',
+							'use_checkbox' => true,
+							'selected_categories' => $selected_categories_source,
+						),
+						//retro compat 1.5 for category tree
+						'values' => array(
+							'trads' => array(
+								'Root' => $root_category,
+								'selected' => $this->l('Selected'),
+								'Collapse All' => $this->l('Collapse All'),
+								'Expand All' => $this->l('Expand All'),
+								'Check All' => $this->l('Check All'),
+								'Uncheck All' => $this->l('Uncheck All')
+							),
+							'selected_cat' => $selected_categories_source,
+							'input_name' => 'categoryBoxSource[]',
+							'use_radio' => false,
+							'use_search' => false,
+							'disabled_categories' => array(),
+							'top_category' => Category::getTopCategory(),
+							'use_context' => true,
+						)
+					),
 					array(
 						'type' => 'categories',
 						'label' => $this->l('Vouchers created by the loyalty system can be used in the following categories:'),
@@ -659,6 +829,45 @@ class Loyalty extends Module
 							'use_context' => true,
 						)
 					),
+					array(
+						'type' => 'switch',
+						'is_bool' => true, //retro-compat
+						'label' => $this->l('Auto-voucher'),
+						'desc' => $this->l('Create voucher automatically on order state change.'),
+						'name' => 'PS_LOYALTY_AUTOVOUCHER',
+						'values' => array(
+							array(
+								'id' => 'active_on',
+								'value' => 1,
+								'label' => $this->l('Enabled')
+							),
+							array(
+								'id' => 'active_off',
+								'value' => 0,
+								'label' => $this->l('Disabled')
+							)
+						)
+					),
+					array(
+						'type' => 'switch',
+						'is_bool' => true, //retro-compat
+						'label' => $this->l('Send e-mail on auto-voucher'),
+						'desc' => $this->l('Send e-mail to customer when new voucher is created.'),
+						'name' => 'PS_LOYALTY_AUTOVOUCHER_EMAIL',
+						'values' => array(
+							array(
+								'id' => 'active_on',
+								'value' => 1,
+								'label' => $this->l('Enabled')
+							),
+							array(
+								'id' => 'active_off',
+								'value' => 0,
+								'label' => $this->l('Disabled')
+							)
+						)
+					),
+
 				),
 				'submit' => array(
 					'title' => $this->l('Save'),
@@ -738,12 +947,15 @@ class Loyalty extends Module
 		$fields_values = array(
 			'point_rate' => Tools::getValue('PS_LOYALTY_POINT_RATE', Configuration::get('PS_LOYALTY_POINT_RATE')),
 			'point_value' => Tools::getValue('PS_LOYALTY_POINT_VALUE', Configuration::get('PS_LOYALTY_POINT_VALUE')),
+			'point_percent' => Tools::getValue('PS_LOYALTY_POINT_PERCENT', Configuration::get('PS_LOYALTY_POINT_PERCENT')),
 			'PS_LOYALTY_NONE_AWARD' => Tools::getValue('PS_LOYALTY_NONE_AWARD', Configuration::get('PS_LOYALTY_NONE_AWARD')),
 			'minimal' => Tools::getValue('PS_LOYALTY_MINIMAL', Configuration::get('PS_LOYALTY_MINIMAL')),
 			'validity_period' => Tools::getValue('PS_LOYALTY_VALIDITY_PERIOD', Configuration::get('PS_LOYALTY_VALIDITY_PERIOD')),
 			'id_order_state_validation' => Tools::getValue('id_order_state_validation', $this->loyaltyStateValidation->id_order_state),
 			'id_order_state_cancel' => Tools::getValue('id_order_state_cancel', $this->loyaltyStateCancel->id_order_state),
 			'PS_LOYALTY_TAX' => Tools::getValue('PS_LOYALTY_TAX', Configuration::get('PS_LOYALTY_TAX')),
+			'PS_LOYALTY_AUTOVOUCHER' => Tools::getValue('PS_LOYALTY_AUTOVOUCHER', Configuration::get('PS_LOYALTY_AUTOVOUCHER')),
+			'PS_LOYALTY_AUTOVOUCHER_EMAIL' => Tools::getValue('PS_LOYALTY_AUTOVOUCHER_EMAIL', Configuration::get('PS_LOYALTY_AUTOVOUCHER_EMAIL')),
 		);
 
 		$languages = Language::getLanguages(false);

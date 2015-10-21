@@ -95,6 +95,18 @@ class LoyaltyModule extends ObjectModel
 			$context->shop = new Shop($context->cart->id_shop);
 			$context->currency = new Currency($context->cart->id_currency, null, $context->shop->id);
 
+			$categories = Configuration::get('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE');
+			if ($categories != '' && $categories != 0)
+				$categories = explode(',', Configuration::get('PS_LOYALTY_VOUCHER_CATEGORY_SOURCE'));
+			else
+				die (Tools::displayError());
+
+			$categories_array =  array();
+			foreach ($categories as $id_category)
+			{
+				array_push($categories_array, array('id_category' => $id_category));
+			}
+
 			$cartProducts = $cart->getProducts();
 			$taxesEnabled = Product::getTaxCalculationMethod();
 			if (isset($newProduct) AND !empty($newProduct))
@@ -115,6 +127,10 @@ class LoyaltyModule extends ObjectModel
 						Context::getContext()->smarty->assign('no_pts_discounted', 1);
 					continue;
 				}
+				/* Avoid generate points for product is not in source category */
+				if (!Product::idIsOnCategoryId((int)$product['id_product'], $categories_array))
+					continue;
+
 				$total += ($taxesEnabled == PS_TAX_EXC ? $product['price'] : $product['price_wt'])* (int)($product['cart_quantity']);
 			}
 			foreach ($cart->getCartRules(false) AS $cart_rule)
